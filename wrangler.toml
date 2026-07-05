@@ -1,3 +1,8 @@
 name = "charity-shield-worker"
 main = "src/index.ts"
-compatibility_date = "2024-01-01"
+compatibility_date = "2026-07-01"  # <-- Set a recent date
+compatibility_flags = ["nodejs_compat"] # <-- This is the key line
+[vars]
+GOOGLE_SAFE_BROWSING_API_KEY = "AIzaSyBBuHgMJBVfMp0AzvQSPJwezQw_M0tGY4I"
+[ai]
+binding = "AI"
