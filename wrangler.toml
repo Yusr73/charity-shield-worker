@@ -6,3 +6,7 @@ compatibility_flags = ["nodejs_compat"] # <-- This is the key line
 GOOGLE_SAFE_BROWSING_API_KEY = "AIzaSyBBuHgMJBVfMp0AzvQSPJwezQw_M0tGY4I"
 [ai]
 binding = "AI"
+[[d1_databases]]
+binding = "DB"
+database_name = "charity-comments"
+database_id = "e2fab25e-d0d6-4698-a7cf-d4eaa69fea23"  # ← Paste your database ID here

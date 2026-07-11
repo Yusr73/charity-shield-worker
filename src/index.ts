@@ -6,8 +6,8 @@ import * as whoiser from 'whoiser';
 
 export interface Env {
   GOOGLE_SAFE_BROWSING_API_KEY?: string;
-   AI: any;
-  // More bindings will go here (KV, AI, etc.)
+  AI: any;
+  DB: D1Database;
 }
 
 // ============================================================
@@ -32,9 +32,18 @@ export default {
       return new Response(null, { headers: corsHeaders() });
     }
 
-    // Main API
+    // --- MAIN API ---
     if (path === '/api/check' && request.method === 'POST') {
       return await handleCheck(request, env);
+    }
+
+    // --- COMMENTS API ---
+    if (path === '/api/comments' && request.method === 'GET') {
+      return await getComments(request, env);
+    }
+
+    if (path === '/api/comments' && request.method === 'POST') {
+      return await postComment(request, env);
     }
 
     // 404
@@ -63,21 +72,17 @@ async function handleCheck(request: Request, env: Env): Promise<Response> {
       return jsonResponse({ error: 'Invalid URL format' }, 400);
     }
 
-    // --- FETCH ALL PAGES ONCE ---
     const pagesData = await fetchAllPages(domain);
 
-    // --- RUN ALL CHECKS IN PARALLEL ---
-    // Helpers that don't need HTML: domain, ssl, reputation
-    // Helpers that need HTML: online presence, registration, language
     const [domainAge, ssl, reputation, onlinePresence, charityRegistration, languageAnalysis] = await Promise.all([
       checkDomainAge(domain),
       checkSSL(domain),
       checkReputation(domain, env),
       checkOnlinePresence(pagesData.allHtml),
       checkCharityRegistration(pagesData.allHtml),
-      checkLanguageAnalysis(pagesData.allHtml, env)    ]);
+      checkLanguageAnalysis(pagesData.allHtml, env)
+    ]);
 
-    // Build the checks array
     const checks = [
       domainAge,
       ssl,
@@ -87,11 +92,14 @@ async function handleCheck(request: Request, env: Env): Promise<Response> {
       languageAnalysis
     ];
 
-    // Return ONLY the data + checks
     return jsonResponse({
       url: fullUrl,
       domain: domain,
-      checks: checks
+      checks: checks,
+      registrar: domainAge.registrar,
+      registrantCountry: domainAge.registrantCountry,
+      registrantOrganization: domainAge.registrantOrganization,
+      sslIssuer: ssl.issuer
     });
 
   } catch (error) {
@@ -101,7 +109,122 @@ async function handleCheck(request: Request, env: Env): Promise<Response> {
 }
 
 // ============================================================
-// 4. UTILITY FUNCTIONS
+// 4. COMMENTS HANDLERS
+// ============================================================
+
+// -----------------------------------------------------------------
+// 4.1 GET COMMENTS
+// -----------------------------------------------------------------
+
+async function getComments(request: Request, env: Env): Promise<Response> {
+  try {
+    const url = new URL(request.url);
+    const domain = url.searchParams.get('domain');
+
+    if (!domain) {
+      return jsonResponse({ error: 'Domain is required' }, 400);
+    }
+
+    console.log('DB binding exists:', !!env.DB);
+    console.log('Fetching comments for domain:', domain);
+
+    if (!env.DB) {
+      console.error('DB binding is undefined');
+      return jsonResponse({ error: 'Database binding not available' }, 500);
+    }
+
+    const result = await env.DB.prepare(
+      `SELECT id, name, email, organization, comment, created_at 
+       FROM comments 
+       WHERE domain = ? 
+       ORDER BY created_at DESC 
+       LIMIT 50`
+    ).bind(domain).all();
+
+    console.log('Query successful, found:', result.results?.length || 0, 'comments');
+
+    return jsonResponse({
+      domain: domain,
+      comments: result.results || []
+    });
+
+  } catch (error) {
+    console.error('Get comments error:', error);
+    return jsonResponse({
+      error: 'Failed to fetch comments',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    }, 500);
+  }
+}
+
+// -----------------------------------------------------------------
+// 4.2 POST COMMENT
+// -----------------------------------------------------------------
+
+async function postComment(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as {
+      domain: string;
+      name: string;
+      email: string;
+      organization?: string;
+      comment: string;
+    };
+
+    console.log('Received comment request for domain:', body.domain);
+
+    if (!body.domain || !body.name || !body.email || !body.comment) {
+      return jsonResponse({ error: 'Missing required fields: domain, name, email, comment' }, 400);
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) {
+      return jsonResponse({ error: 'Invalid email format' }, 400);
+    }
+
+    if (body.comment.length < 10) {
+      return jsonResponse({ error: 'Comment must be at least 10 characters' }, 400);
+    }
+
+    try {
+      new URL(`https://${body.domain}`);
+    } catch {
+      return jsonResponse({ error: 'Invalid domain format' }, 400);
+    }
+
+    if (!env.DB) {
+      console.error('DB binding is undefined');
+      return jsonResponse({ error: 'Database binding not available' }, 500);
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO comments (domain, name, email, organization, comment) 
+       VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      body.domain,
+      body.name,
+      body.email,
+      body.organization || '',
+      body.comment
+    ).run();
+
+    console.log('Comment inserted successfully');
+
+    return jsonResponse({
+      success: true,
+      message: 'Comment submitted successfully'
+    });
+
+  } catch (error) {
+    console.error('Post comment error:', error);
+    return jsonResponse({
+      error: 'Failed to submit comment',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    }, 500);
+  }
+}
+
+// ============================================================
+// 5. UTILITY FUNCTIONS
 // ============================================================
 
 function corsHeaders(): Record<string, string> {
@@ -130,7 +253,7 @@ function normalizeUrl(url: string): string {
 }
 
 // ============================================================
-// 4.5 FETCH ALL PAGES
+// 6. FETCH ALL PAGES
 // ============================================================
 
 async function fetchAllPages(domain: string): Promise<{
@@ -139,14 +262,8 @@ async function fetchAllPages(domain: string): Promise<{
   pages: { url: string; html: string }[];
 }> {
   const paths = [
-    '',              // Homepage
-    '/about',
-    '/about-us',
-    '/contact',
-    '/contact-us',
-    '/mission',
-    '/donate',
-    '/donation'
+    '', '/about', '/about-us', '/contact', '/contact-us',
+    '/mission', '/donate', '/donation'
   ];
 
   const pages: { url: string; html: string }[] = [];
@@ -172,14 +289,11 @@ async function fetchAllPages(domain: string): Promise<{
 }
 
 // ============================================================
-// 5. HELPER FUNCTIONS - CHECKS
+// 7. HELPER FUNCTIONS - CHECKS
 // ============================================================
 
 // -----------------------------------------------------------------
-// 5.1 DOMAIN AGE (WHOIS)
-// -----------------------------------------------------------------
-// Returns: { category, name, value, color, meaning, details }
-// Colors: green (5+ years), yellow (1-5 years), orange (<1 year), red (<30 days), gray (unknown)
+// 7.1 DOMAIN AGE (WHOIS)
 // -----------------------------------------------------------------
 
 async function checkDomainAge(domain: string): Promise<{
@@ -189,6 +303,9 @@ async function checkDomainAge(domain: string): Promise<{
   color: 'green' | 'yellow' | 'orange' | 'red' | 'gray';
   meaning: string;
   details: string;
+  registrantCountry: string;
+  registrar: string;
+  registrantOrganization: string;
 }> {
   const defaultResult = {
     category: 'Domain',
@@ -196,7 +313,10 @@ async function checkDomainAge(domain: string): Promise<{
     value: 'Unknown',
     color: 'gray' as const,
     meaning: 'Could not verify domain age',
-    details: ''
+    details: '',
+    registrantCountry: '',
+    registrar: '',
+    registrantOrganization: ''
   };
 
   try {
@@ -209,6 +329,10 @@ async function checkDomainAge(domain: string): Promise<{
     if (!data || typeof data !== 'object') return defaultResult;
 
     const createdDate = data['Created Date'] || data['Creation Date'] || '';
+    const registrantCountry = data['Registrant Country'] || data['Country'] || '';
+    const registrar = data['Registrar'] || '';
+    const registrantOrganization = data['Registrant Organization'] || data['Organization'] || '';
+
     if (!createdDate) return defaultResult;
 
     const created = new Date(createdDate);
@@ -255,7 +379,10 @@ async function checkDomainAge(domain: string): Promise<{
       value: value,
       color: color,
       meaning: meaning,
-      details: details
+      details: details,
+      registrantCountry: registrantCountry,
+      registrar: registrar,
+      registrantOrganization: registrantOrganization
     };
 
   } catch (error) {
@@ -265,9 +392,7 @@ async function checkDomainAge(domain: string): Promise<{
 }
 
 // -----------------------------------------------------------------
-// 5.2 SSL CERTIFICATE
-// -----------------------------------------------------------------
-// Colors: green (valid), red (invalid/missing)
+// 7.2 SSL CERTIFICATE
 // -----------------------------------------------------------------
 
 async function checkSSL(domain: string): Promise<{
@@ -277,6 +402,7 @@ async function checkSSL(domain: string): Promise<{
   color: 'green' | 'yellow' | 'orange' | 'red' | 'gray';
   meaning: string;
   details: string;
+  issuer: string;
 }> {
   const defaultResult = {
     category: 'Security',
@@ -284,7 +410,8 @@ async function checkSSL(domain: string): Promise<{
     value: 'Unknown',
     color: 'gray' as const,
     meaning: 'Could not verify SSL certificate',
-    details: ''
+    details: '',
+    issuer: ''
   };
 
   try {
@@ -299,17 +426,20 @@ async function checkSSL(domain: string): Promise<{
     let value: string;
     let meaning: string;
     let details: string;
+    let issuer: string;
 
     if (isValid) {
       color = 'green';
       value = 'Valid';
       meaning = 'Website is secure';
       details = `Status: ${response.status}`;
+      issuer = 'Valid SSL certificate';
     } else {
       color = 'red';
       value = 'Invalid';
       meaning = 'Website is not secure - do not enter any data';
       details = `Status: ${response.status}`;
+      issuer = 'Invalid or missing';
     }
 
     return {
@@ -318,7 +448,8 @@ async function checkSSL(domain: string): Promise<{
       value: value,
       color: color,
       meaning: meaning,
-      details: details
+      details: details,
+      issuer: issuer
     };
 
   } catch (error) {
@@ -329,15 +460,14 @@ async function checkSSL(domain: string): Promise<{
       value: 'Invalid',
       color: 'red',
       meaning: 'Website is not secure - could not establish HTTPS connection',
-      details: error.message || 'Connection failed'
+      details: error.message || 'Connection failed',
+      issuer: 'Unknown'
     };
   }
 }
 
 // -----------------------------------------------------------------
-// 5.3 REPUTATION (Google Safe Browsing)
-// -----------------------------------------------------------------
-// Colors: green (clean), red (malicious/phishing), gray (unknown)
+// 7.3 REPUTATION (Google Safe Browsing)
 // -----------------------------------------------------------------
 
 async function checkReputation(domain: string, env: Env): Promise<{
@@ -442,11 +572,7 @@ async function checkReputation(domain: string, env: Env): Promise<{
 }
 
 // -----------------------------------------------------------------
-// 5.4 ONLINE PRESENCE (Contact Info + Social Media)
-// -----------------------------------------------------------------
-// Now accepts combined HTML from all pages
-// Colors: green (address + contact), yellow (address only),
-//         orange (no address but some contact), red (no presence)
+// 7.4 ONLINE PRESENCE (Contact Info + Social Media)
 // -----------------------------------------------------------------
 
 async function checkOnlinePresence(html: string): Promise<{
@@ -478,7 +604,6 @@ async function checkOnlinePresence(html: string): Promise<{
   }
 
   try {
-    // --- CHECK CONTACT INFO ---
     let hasAddress = false;
     let hasPhone = false;
     let hasEmail = false;
@@ -537,7 +662,6 @@ async function checkOnlinePresence(html: string): Promise<{
     if (phone) phone = phone.replace(/\s+/g, ' ').trim();
     if (email) email = email.replace(/\s+/g, ' ').trim();
 
-    // --- CHECK SOCIAL MEDIA ---
     const socialPatterns = {
       twitter: /twitter\.com\/[a-zA-Z0-9_]+/i,
       facebook: /facebook\.com\/[a-zA-Z0-9.]+/i,
@@ -558,7 +682,6 @@ async function checkOnlinePresence(html: string): Promise<{
     if (socialResults.linkedin) activePlatforms.push('LinkedIn');
     if (socialResults.instagram) activePlatforms.push('Instagram');
 
-    // --- BUILD DETAILS ---
     const contactParts = [];
     if (hasAddress) contactParts.push('address');
     if (hasPhone) contactParts.push('phone');
@@ -567,7 +690,6 @@ async function checkOnlinePresence(html: string): Promise<{
     const socialSummary = activePlatforms.length > 0 ? activePlatforms.join(', ') : 'none';
     const details = `Contact: ${contactSummary} | Social: ${socialSummary}`;
 
-    // --- COLOR LOGIC ---
     if (hasAddress && (hasPhone || hasEmail)) {
       return {
         category: 'Presence',
@@ -617,10 +739,7 @@ async function checkOnlinePresence(html: string): Promise<{
 }
 
 // -----------------------------------------------------------------
-// 5.5 CHARITY REGISTRATION
-// -----------------------------------------------------------------
-// Now accepts combined HTML from all pages
-// Colors: green (found), yellow (mentioned but no number), orange (not found)
+// 7.5 CHARITY REGISTRATION
 // -----------------------------------------------------------------
 
 async function checkCharityRegistration(html: string): Promise<{
@@ -660,7 +779,6 @@ async function checkCharityRegistration(html: string): Promise<{
     let meaning = '';
     let details = '';
 
-    // US 501(c)(3)
     if (/501\(c\)\(3\)/i.test(html)) {
       found = true;
       type = '501(c)(3) (US)';
@@ -669,7 +787,6 @@ async function checkCharityRegistration(html: string): Promise<{
       if (einMatch) number = einMatch[1];
     }
 
-    // UK Charity Commission
     if (!found) {
       const ukMatch = html.match(/registered\s+charity\s+number:\s*(\d{5,10})/i);
       if (ukMatch) {
@@ -679,7 +796,6 @@ async function checkCharityRegistration(html: string): Promise<{
       }
     }
 
-    // Canada Registration
     if (!found) {
       const caMatch = html.match(/(?:BN|Registration Number):\s*(\d{15})/i);
       if (caMatch) {
@@ -689,7 +805,6 @@ async function checkCharityRegistration(html: string): Promise<{
       }
     }
 
-    // General patterns
     if (!found) {
       const patterns = [
         /charity\s+number:\s*([A-Z0-9\-]+)/i,
@@ -723,10 +838,10 @@ async function checkCharityRegistration(html: string): Promise<{
       meaning = 'Charity mentioned but no registration number found';
       details = 'Website references charity but no registration number';
     } else {
-      color = 'orange';
+      color = 'gray';
       value = 'Not Found';
-      meaning = 'No charity registration found on website';
-      details = 'No registration number or charity mention found';
+      meaning = 'No registration information found on website';
+      details = 'Charities often display registration in footer or about page';
     }
 
     return {
@@ -745,14 +860,7 @@ async function checkCharityRegistration(html: string): Promise<{
 }
 
 // -----------------------------------------------------------------
-// 5.6 LANGUAGE ANALYSIS (AI-Powered)
-// -----------------------------------------------------------------
-// Uses Cloudflare Workers AI to analyze website language
-// Colors: green (clean), yellow (mixed), orange (suspicious), red (critical)
-// -----------------------------------------------------------------
-
-// -----------------------------------------------------------------
-// 5.6 LANGUAGE ANALYSIS (AI-Powered - Scam Pattern Focused)
+// 7.6 LANGUAGE ANALYSIS (AI-Powered)
 // -----------------------------------------------------------------
 
 async function checkLanguageAnalysis(html: string, env: Env): Promise<{
@@ -801,7 +909,6 @@ async function checkLanguageAnalysis(html: string, env: Env): Promise<{
       };
     }
 
-    // --- AI CALL ---
     const aiResponse = await env.AI.run(
       '@cf/meta/llama-3.2-3b-instruct',
       {
@@ -835,7 +942,6 @@ ${text.substring(0, 2000)}
       }
     );
 
-    // Parse AI response
     let result;
     try {
       const aiText = aiResponse.response || aiResponse;
