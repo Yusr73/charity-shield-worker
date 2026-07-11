@@ -982,4 +982,5 @@ ${text.substring(0, 2000)}
     console.error('Language analysis error:', error);
     return defaultResult;
   }
-}
+}/ /   C I / C D   t e s t  
+ 
